@@ -63,6 +63,11 @@ def noun_without_article(text: str) -> str:
     return clean
 
 
+def normalize_text_answer(text: str) -> str:
+    # Compare user input robustly while keeping umlauts/special letters intact.
+    return " ".join(text.strip().lower().split())
+
+
 def new_card(de: str, en: str, notes: str, article: str = "") -> Card:
     now = utc_now()
     card_id = f"{int(now.timestamp() * 1000)}-{random.randint(1000, 9999)}"
@@ -173,6 +178,23 @@ def find_card(cards: List[Card], card_id: str) -> Optional[int]:
         if c.id == card_id:
             return i
     return None
+
+
+def daily_study_pool(cards: List[Card], now: datetime, size: int = 20) -> List[Card]:
+    """
+    Returns a deterministic daily batch that changes every day.
+    """
+    if not cards:
+        return []
+    ordered = sorted(cards, key=lambda c: (c.created_at or "", c.id))
+    if len(ordered) <= size:
+        return ordered
+
+    day_index = now.date().toordinal()
+    start = (day_index * size) % len(ordered)
+
+    # Wrap around so the batch always has `size` cards.
+    return [ordered[(start + i) % len(ordered)] for i in range(size)]
 
 
 def pick_quiz_choices(cards: List[Card], correct_id: str, k: int = 4) -> List[Card]:
@@ -314,6 +336,8 @@ def reset_session_state() -> None:
         "test_size",
         "article_card_id",
         "article_feedback",
+        "writing_card_id",
+        "writing_feedback",
     ]:
         if k in st.session_state:
             del st.session_state[k]
@@ -351,6 +375,7 @@ st.markdown(
     div[data-testid="stHorizontalBlock"] button[kind="secondary"] {
         border-radius: 10px;
     }
+
     </style>
     """,
     unsafe_allow_html=True,
@@ -373,8 +398,8 @@ col_a.metric("Total words", total)
 col_b.metric("Due now", due)
 col_c.metric("New today", sum(1 for c in cards if (c.created_at and iso_to_dt(c.created_at).date() == now.date())))
 
-tab_add, tab_study, tab_quiz, tab_test, tab_articles, tab_manage = st.tabs(
-    ["Add", "Study", "Quiz", "Test", "Articles", "Manage"]
+tab_add, tab_study, tab_quiz, tab_writing, tab_test, tab_articles, tab_manage = st.tabs(
+    ["Add", "Study", "Quiz", "Writing", "Test", "Articles", "Manage"]
 )
 
 with tab_add:
@@ -495,6 +520,9 @@ with tab_quiz:
     if len(cards) < 2:
         st.info("Add at least 2 words to quiz yourself.")
     else:
+        quiz_pool = daily_study_pool(cards, now, size=20)
+        pool_ids = {c.id for c in quiz_pool}
+        st.caption(f"Daily quiz set: **{len(quiz_pool)}** words. This set changes automatically tomorrow.")
         direction = st.radio(
             "Quiz direction",
             ["🇩🇪➡️🇷🇺 German -> Russian", "🇷🇺➡️🇩🇪 Russian -> German"],
@@ -503,28 +531,28 @@ with tab_quiz:
         )
 
         if "quiz_card_id" not in st.session_state:
-            st.session_state.quiz_card_id = random.choice(cards).id
-            st.session_state.quiz_choices = [c.id for c in pick_quiz_choices(cards, st.session_state.quiz_card_id, k=4)]
+            st.session_state.quiz_card_id = random.choice(quiz_pool).id
+            st.session_state.quiz_choices = [c.id for c in pick_quiz_choices(quiz_pool, st.session_state.quiz_card_id, k=4)]
             st.session_state.quiz_answered = False
             st.session_state.quiz_feedback = None
             st.session_state.quiz_last_direction = direction
 
-        if st.session_state.get("quiz_last_direction") != direction:
-            st.session_state.quiz_card_id = random.choice(cards).id
-            st.session_state.quiz_choices = [c.id for c in pick_quiz_choices(cards, st.session_state.quiz_card_id, k=4)]
+        if st.session_state.get("quiz_last_direction") != direction or st.session_state.quiz_card_id not in pool_ids:
+            st.session_state.quiz_card_id = random.choice(quiz_pool).id
+            st.session_state.quiz_choices = [c.id for c in pick_quiz_choices(quiz_pool, st.session_state.quiz_card_id, k=4)]
             st.session_state.quiz_answered = False
             st.session_state.quiz_feedback = None
             st.session_state.quiz_last_direction = direction
 
         q_idx = find_card(cards, st.session_state.quiz_card_id)
         if q_idx is None:
-            st.session_state.quiz_card_id = random.choice(cards).id
-            st.session_state.quiz_choices = [c.id for c in pick_quiz_choices(cards, st.session_state.quiz_card_id, k=4)]
+            st.session_state.quiz_card_id = random.choice(quiz_pool).id
+            st.session_state.quiz_choices = [c.id for c in pick_quiz_choices(quiz_pool, st.session_state.quiz_card_id, k=4)]
             st.session_state.quiz_answered = False
             st.session_state.quiz_feedback = None
             q_idx = find_card(cards, st.session_state.quiz_card_id)
 
-        q_card = cards[q_idx] if q_idx is not None else random.choice(cards)
+        q_card = cards[q_idx] if q_idx is not None else random.choice(quiz_pool)
         if direction.startswith("🇩🇪"):
             st.write(f"**German:** {q_card.de}")
         else:
@@ -539,7 +567,7 @@ with tab_quiz:
             if i is not None:
                 choice_cards.append(cards[i])
         if q_card.id not in [c.id for c in choice_cards]:
-            choice_cards = pick_quiz_choices(cards, q_card.id, k=4)
+            choice_cards = pick_quiz_choices(quiz_pool, q_card.id, k=4)
 
         if direction.startswith("🇩🇪"):
             st.write("Pick the Russian meaning:")
@@ -551,9 +579,9 @@ with tab_quiz:
                 st.session_state.quiz_answered = True
                 if c.id == q_card.id:
                     # Auto-advance immediately after a correct answer.
-                    st.session_state.quiz_card_id = random.choice(cards).id
+                    st.session_state.quiz_card_id = random.choice(quiz_pool).id
                     st.session_state.quiz_choices = [
-                        cc.id for cc in pick_quiz_choices(cards, st.session_state.quiz_card_id, k=4)
+                        cc.id for cc in pick_quiz_choices(quiz_pool, st.session_state.quiz_card_id, k=4)
                     ]
                     st.session_state.quiz_answered = False
                     st.session_state.quiz_feedback = None
@@ -572,8 +600,8 @@ with tab_quiz:
 
         coln1, coln2 = st.columns(2)
         if coln1.button("New question"):
-            st.session_state.quiz_card_id = random.choice(cards).id
-            st.session_state.quiz_choices = [c.id for c in pick_quiz_choices(cards, st.session_state.quiz_card_id, k=4)]
+            st.session_state.quiz_card_id = random.choice(quiz_pool).id
+            st.session_state.quiz_choices = [c.id for c in pick_quiz_choices(quiz_pool, st.session_state.quiz_card_id, k=4)]
             st.session_state.quiz_answered = False
             st.session_state.quiz_feedback = None
             st.rerun()
@@ -585,6 +613,81 @@ with tab_quiz:
                 cards[i] = srs_grade(cards[i], 2, now)
                 save_cards(cards)
                 st.success("Scheduled next review.")
+
+with tab_writing:
+    st.subheader("Writing Trainer")
+    st.caption("You see Russian. Type the German word exactly by letters.")
+
+    if not cards:
+        st.info("Add at least 1 word to start writing practice.")
+    else:
+        writing_pool = daily_study_pool(cards, now, size=20)
+        writing_pool_ids = {c.id for c in writing_pool}
+        st.caption(f"Daily writing set: **{len(writing_pool)}** words (same as Quiz).")
+
+        if "writing_card_id" not in st.session_state:
+            st.session_state.writing_card_id = random.choice(writing_pool).id
+            st.session_state.writing_feedback = None
+        if "writing_green_input" not in st.session_state:
+            st.session_state.writing_green_input = False
+
+        w_idx = find_card(cards, st.session_state.writing_card_id)
+        if w_idx is None or st.session_state.writing_card_id not in writing_pool_ids:
+            st.session_state.writing_card_id = random.choice(writing_pool).id
+            st.session_state.writing_feedback = None
+            st.session_state.writing_green_input = False
+            w_idx = find_card(cards, st.session_state.writing_card_id)
+
+        w_card = cards[w_idx] if w_idx is not None else random.choice(writing_pool)
+
+        st.write(f"**Russian:** {w_card.en}")
+        if w_card.notes:
+            with st.expander("Hint (notes)"):
+                st.write(w_card.notes)
+
+        if st.session_state.get("writing_green_input"):
+            st.markdown(
+                """
+                <style>
+                div[data-testid="stTextInput"] input {
+                    background-color: #dcfce7 !important;
+                    border-color: #16a34a !important;
+                }
+                </style>
+                """,
+                unsafe_allow_html=True,
+            )
+
+        with st.form("writing_form", clear_on_submit=True):
+            user_answer = st.text_input("Type German (Deutsch)")
+            submitted = st.form_submit_button("Check")
+
+        if submitted:
+            expected = normalize_text_answer(w_card.de)
+            got = normalize_text_answer(user_answer)
+            if got == expected:
+                st.session_state.writing_feedback = ("success", "Correct! Moving to the next word...")
+                st.session_state.writing_green_input = True
+                i = find_card(cards, w_card.id)
+                if i is not None:
+                    cards[i] = srs_grade(cards[i], 2, now)
+                    save_cards(cards)
+                st.session_state.writing_card_id = random.choice(writing_pool).id
+                st.rerun()
+            else:
+                st.session_state.writing_feedback = (
+                    "error",
+                    f"Not correct. Right answer: **{w_card.de}**",
+                )
+                st.session_state.writing_green_input = False
+
+        wf = st.session_state.get("writing_feedback")
+        if wf:
+            level, msg = wf
+            if level == "success":
+                st.success(msg)
+            else:
+                st.error(msg)
 
 with tab_manage:
     st.subheader("All words")
@@ -791,4 +894,5 @@ with tab_test:
                 st.session_state.test_index = 0
                 st.session_state.test_score = 0
                 st.rerun()
+
 
